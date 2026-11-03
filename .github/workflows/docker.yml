@@ -1,0 +1,70 @@
+name: Docker
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/mapeak-com/mapterhorn-to-valhalla
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: mapterhorn-to-valhalla:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test image
+        run: |
+          mkdir out
+          docker run --rm --user "$(id -u):$(id -g)" -v "$PWD/out:/out" mapterhorn-to-valhalla:ci -b 34.2,32.2,34.8,32.8 -o /out -d -v
+          test "$(stat -c %s out/N32/N32E034.hgt)" -eq 25934402
+          docker run --rm -v "$PWD/out:/out" --entrypoint python3 mapterhorn-to-valhalla:ci -c "
+          import numpy
+          heights = numpy.fromfile('/out/N32/N32E034.hgt', '>i2')
+          assert (heights != -32768).all()
+          assert 300 < heights.max() < 450, heights.max()
+          "
+
+      - uses: docker/metadata-action@v6
+        id: meta
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/login-action@v4
+        if: github.event_name != 'pull_request'
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish image
+        if: github.event_name != 'pull_request'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha

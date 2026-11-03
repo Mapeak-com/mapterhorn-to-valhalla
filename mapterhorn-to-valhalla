@@ -1,0 +1,302 @@
+#!/usr/bin/env python3
+"""Writes Valhalla elevation tiles from Mapterhorn terrain tiles.
+
+Each 1x1 degree cell becomes a 3601x3601 .hgt file in Valhalla's N32/N32E034.hgt
+layout. Without -t, -b or -g the cells are selected as -t does.
+
+Usage:
+  mapterhorn-to-valhalla [options] [-v...] [-t | -b BBOX | -g DIR] [-d | -z]
+  mapterhorn-to-valhalla -h | --help
+
+Options:
+  -t --from-tiles          Cells covered by the level-2 tiles of the Valhalla graph in mjolnir.tile_dir of the config.
+  -b --from-bbox BBOX      Cells intersecting the bounding box minX,minY,maxX,maxY.
+  -g --from-geojson DIR    Cells intersecting the polygons of the .geojson files in DIR. Requires shapely.
+  -c --config FILE         Valhalla config JSON.
+  -i --inline-config JSON  Inline JSON config, overrides --config [default: {}].
+  -o --outdir DIR          Output directory, overrides additional_data.elevation of the config.
+  -s --source PMTILES      Mapterhorn archive URL or path [default: https://download.mapterhorn.com/planet.pmtiles].
+  -p --parallelism N       Number of cells converted at once, defaults to the number of available cores.
+  -d --decompress          Write uncompressed .hgt files.
+  -z --lz4                 Write .hgt.lz4 files. Requires lz4.
+  -f --force               Overwrite existing files.
+  -v --verbosity           Accumulative verbosity flags; -v: INFO, -vv: DEBUG.
+  -h --help                Show this screen.
+"""
+
+import gzip
+import importlib
+import json
+import logging
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from collections import namedtuple
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from functools import partial
+from math import ceil, floor, log, pi, radians, tan
+from pathlib import Path
+
+def ensure_package(module, package=None):
+  """Import a module, installing its package with pip when it is missing."""
+  try:
+    return importlib.import_module(module)
+  except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "--break-system-packages", package or module])
+    return importlib.import_module(module)
+
+docopt = ensure_package("docopt").docopt
+np = ensure_package("numpy")
+gdal = ensure_package("osgeo.gdal", "GDAL")
+
+LOGGER = logging.getLogger("mapterhorn-to-valhalla")
+Cell = namedtuple("Cell", ["lon", "lat"])
+LOCAL_SIZE = 0.25
+HGT_DIM = 3601
+HGT_BYTES = 2 * HGT_DIM * HGT_DIM
+NO_DATA = -32768
+ZOOM = 12
+MARGIN = 0.01
+MAX_LAT = 85.0511287798066
+EARTH_RADIUS = 6378137.0
+EXTENSIONS = {"raw": "", "gzip": ".gz", "lz4": ".lz4"}
+
+def get_tile_path(cell):
+  """Return the path of a cell's .hgt file relative to the elevation directory, as Valhalla names it."""
+  hemisphere = "S" if cell.lat < 0 else "N"
+  dir_name = "%s%02d" % (hemisphere, abs(cell.lat))
+  tile_name = "%s%02d%s%03d.hgt" % (hemisphere, abs(cell.lat), "W" if cell.lon < 0 else "E", abs(cell.lon))
+  return Path(dir_name, tile_name)
+
+def grid_from_bounds(bounds):
+  """Yield the 1x1 degree grid rectangles covering the given bounds."""
+  min_x = floor(bounds[0])
+  min_y = floor(bounds[1])
+  max_x = ceil(bounds[-2])
+  max_y = ceil(bounds[-1])
+  for x in range(min_x, max_x):
+    for y in range(min_y, max_y):
+      yield [x, y, x + 1, y + 1]
+
+def get_cells_with_geojson(input_dir):
+  """Return the cells intersecting the polygons of the .geojson files in a directory."""
+  geometry = ensure_package("shapely.geometry", "shapely")
+  if not input_dir.is_dir() or not len(list(input_dir.glob("*.geojson"))) > 0:
+    LOGGER.critical(f"Geojson directory does not exist or contains no GeoJSON files: {input_dir.resolve()}")
+    sys.exit(1)
+
+  def get_outer_rings(input_dir):
+    """Yield the outer ring of every polygon in the .geojson files of a directory."""
+    for file in input_dir.glob("*.geojson"):
+      with open(file) as f:
+        geojson = json.load(f)
+      for feature in geojson["features"]:
+        if feature["geometry"]["type"] == "Polygon":
+          yield geometry.Polygon(feature["geometry"]["coordinates"][0])
+        if feature["geometry"]["type"] == "MultiPolygon":
+          for single_polygon in feature["geometry"]["coordinates"]:
+            yield geometry.Polygon(single_polygon[0])
+  cells = set()
+  for poly in get_outer_rings(input_dir):
+    for rect in grid_from_bounds(poly.bounds):
+      if poly.intersects(geometry.box(*rect)):
+        cells.add(Cell(rect[0], rect[1]))
+  return cells
+
+def get_cells_with_bbox(bbox_str):
+  """Return the cells intersecting a minX,minY,maxX,maxY bounding box."""
+  try:
+    bbox = [float(x) for x in bbox_str.split(",")]
+  except ValueError:
+    LOGGER.critical(f"BBOX {bbox_str} is not a comma-separated string of coordinates.")
+    sys.exit(1)
+  if len(bbox) != 4 or bbox[0] > bbox[2] or bbox[0] < -180 or bbox[2] > 180 or bbox[1] > bbox[3] or bbox[1] < -90 or bbox[3] > 90:
+    LOGGER.critical(f"Bbox invalid: {bbox}")
+    sys.exit(1)
+  LOGGER.debug(f"Received valid bbox: {bbox}")
+  return {Cell(rect[0], rect[1]) for rect in grid_from_bounds(bbox)}
+
+def get_cells_with_graph(graph_dir):
+  """Return the cells covered by the level-2 tiles of a Valhalla graph directory."""
+  if not graph_dir.is_dir():
+    LOGGER.critical(f"Graph directory {graph_dir.resolve()} does not exist.")
+    sys.exit(1)
+  cells = set()
+  local_dir = graph_dir.joinpath("2")
+  tile_width = int(360 / LOCAL_SIZE)
+  for tile_fp in local_dir.rglob("*.gph"):
+    tile_id = int(str(tile_fp.parent.relative_to(local_dir).joinpath(tile_fp.stem)).replace(os.sep, ""))
+    tile_x = floor(int(tile_id % tile_width) * LOCAL_SIZE - 180)
+    tile_y = floor(int(tile_id / tile_width) * LOCAL_SIZE - 90)
+    cells.add(Cell(tile_x, tile_y))
+  return cells
+
+def get_window(cell):
+  """Return the cell's bounds with a margin, limited to the Web Mercator extent, or None outside it."""
+  min_lat = max(cell.lat - MARGIN, -MAX_LAT)
+  max_lat = min(cell.lat + 1 + MARGIN, MAX_LAT)
+  if min_lat >= max_lat:
+    return None
+  return [max(cell.lon - MARGIN, -180.0), min_lat, min(cell.lon + 1 + MARGIN, 180.0), max_lat]
+
+def mercator_x(lon):
+  """Return the Web Mercator x coordinate of a longitude."""
+  return EARTH_RADIUS * radians(lon)
+
+def mercator_y(lat):
+  """Return the Web Mercator y coordinate of a latitude."""
+  return EARTH_RADIUS * log(tan(pi / 4 + radians(lat) / 2))
+
+def wms_xml(url):
+  """Return a GDAL WMS description of a z/x/y Terrarium tile service at the given URL template."""
+  extent = mercator_x(180.0)
+  return (
+    "<GDAL_WMS><Service name=\"TMS\"><ServerUrl>" + url + "</ServerUrl></Service>"
+    "<DataWindow><UpperLeftX>" + repr(-extent) + "</UpperLeftX><UpperLeftY>" + repr(extent) + "</UpperLeftY>"
+    "<LowerRightX>" + repr(extent) + "</LowerRightX><LowerRightY>" + repr(-extent) + "</LowerRightY>"
+    "<TileLevel>" + str(ZOOM) + "</TileLevel><TileCountX>1</TileCountX><TileCountY>1</TileCountY><YOrigin>top</YOrigin></DataWindow>"
+    "<Projection>EPSG:3857</Projection><BlockSizeX>512</BlockSizeX><BlockSizeY>512</BlockSizeY><BandsCount>3</BandsCount>"
+    "<ZeroBlockHttpCodes>204,404</ZeroBlockHttpCodes></GDAL_WMS>"
+  )
+
+def write(path, data, compression):
+  """Write a cell's elevation file atomically with the requested compression."""
+  if compression == "gzip":
+    data = gzip.compress(data)
+  elif compression == "lz4":
+    lz4 = ensure_package("lz4.frame", "lz4")
+    with lz4.LZ4FrameCompressor(block_size=lz4.BLOCKSIZE_MAX4MB, compression_level=6) as compressor:
+      data = compressor.begin(HGT_BYTES) + compressor.compress(data) + compressor.flush()
+  path.parent.mkdir(parents=True, exist_ok=True)
+  temporary = path.with_name("." + path.name + ".tmp")
+  temporary.write_bytes(data)
+  os.replace(temporary, path)
+
+def convert(archive_name, cell, port, path, compression):
+  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written."""
+  gdal.UseExceptions()
+  gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
+  window = get_window(cell)
+  source = gdal.Open(wms_xml("http://127.0.0.1:%d/%s/${z}/${x}/${y}.webp" % (port, archive_name)))
+  rgb = gdal.Translate("", source, format="MEM", projWin=[mercator_x(window[0]), mercator_y(window[3]), mercator_x(window[2]), mercator_y(window[1])])
+  bands = rgb.ReadAsArray()
+  black = (bands[0] == 0) & (bands[1] == 0) & (bands[2] == 0)
+  elevation = np.where(black, NO_DATA, bands[0] * 256.0 + bands[1] + bands[2] / 256.0 - 32768).astype(np.float32)
+  decoded = gdal.GetDriverByName("MEM").Create("", rgb.RasterXSize, rgb.RasterYSize, 1, gdal.GDT_Float32)
+  decoded.SetGeoTransform(rgb.GetGeoTransform())
+  decoded.SetProjection(rgb.GetProjection())
+  decoded.GetRasterBand(1).SetNoDataValue(NO_DATA)
+  decoded.GetRasterBand(1).WriteArray(elevation)
+  half = 0.5 / (HGT_DIM - 1)
+  hgt = gdal.Warp("", decoded, format="MEM", dstSRS="EPSG:4326", outputBounds=[cell.lon - half, cell.lat - half, cell.lon + 1 + half, cell.lat + 1 + half], width=HGT_DIM, height=HGT_DIM, resampleAlg="bilinear", srcNodata=NO_DATA, dstNodata=NO_DATA, outputType=gdal.GDT_Int16)
+  heights = hgt.ReadAsArray()
+  if (heights == NO_DATA).all():
+    return False
+  write(path, heights.astype(">i2").tobytes(), compression)
+  return True
+
+def extract(source, archive, window):
+  """Extract the z12 tiles of a window from the Mapterhorn archive, retrying like valhalla_build_elevation."""
+  command = ["pmtiles", "extract", source, str(archive), "--bbox=%.6f,%.6f,%.6f,%.6f" % tuple(window), "--minzoom=%d" % ZOOM, "--maxzoom=%d" % ZOOM, "--quiet"]
+  for i in range(5):
+    time.sleep((i**2) / 2 * 30)
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode == 0:
+      return True
+    LOGGER.error(f"Extracting {archive.stem} failed: {result.stderr.strip()}\nTrying again...")
+  return False
+
+def process_cell(cell, settings, converters):
+  """Extract, convert and write one cell, returning its outcome."""
+  path = settings["outdir"].joinpath(get_tile_path(cell)).with_suffix(".hgt" + EXTENSIONS[settings["compression"]])
+  if path.is_file() and not settings["force"]:
+    return "skipped"
+  window = get_window(cell)
+  if window is None:
+    return "no data"
+  archive = settings["tmpdir"].joinpath(path.name.split(".")[0] + ".pmtiles")
+  try:
+    if not extract(settings["source"], archive, window):
+      LOGGER.error(f"Tile {path.name} couldn't be extracted...")
+      return "failed"
+    written = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
+  except Exception as e:
+    LOGGER.error(f"Tile {path.name} failed: {e}")
+    return "failed"
+  finally:
+    archive.unlink(missing_ok=True)
+  LOGGER.info(f"{'Wrote' if written else 'No Mapterhorn data for'} {path.relative_to(settings['outdir'])}")
+  return "written" if written else "no data"
+
+def free_port():
+  """Return a free local TCP port."""
+  with socket.socket() as s:
+    s.bind(("127.0.0.1", 0))
+    return s.getsockname()[1]
+
+def serve(directory, port):
+  """Start pmtiles serve on a local port for the archives in a directory, returning the process once it accepts connections."""
+  process = subprocess.Popen(["pmtiles", "serve", str(directory), "--interface=127.0.0.1", "--port=%d" % port], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+  for i in range(100):
+    try:
+      socket.create_connection(("127.0.0.1", port), timeout=1).close()
+      return process
+    except OSError:
+      time.sleep(0.1)
+  process.terminate()
+  LOGGER.critical("pmtiles serve did not start.")
+  sys.exit(1)
+
+def main():
+  """Parse the command line, select the cells and write their elevation files."""
+  args = docopt(__doc__)
+  handler = logging.StreamHandler()
+  handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)5s: %(message)s"))
+  LOGGER.addHandler(handler)
+  LOGGER.setLevel([logging.CRITICAL, logging.INFO, logging.DEBUG][min(args["--verbosity"], 2)])
+  config = dict()
+  if args["--config"]:
+    with open(args["--config"]) as f:
+      config = json.load(f)
+  config.update(**json.loads(args["--inline-config"]))
+  if args["--outdir"]:
+    outdir = Path(args["--outdir"])
+  elif config:
+    outdir = Path(config["additional_data"]["elevation"] or "elevation")
+  else:
+    LOGGER.critical("Either config or outdir is required.")
+    sys.exit(1)
+  if args["--from-geojson"]:
+    cells = get_cells_with_geojson(Path(args["--from-geojson"]))
+  elif args["--from-bbox"]:
+    cells = get_cells_with_bbox(args["--from-bbox"])
+  else:
+    if not config:
+      LOGGER.critical("--from-tiles requires a config to be specified.")
+      sys.exit(1)
+    cells = get_cells_with_graph(Path(config["mjolnir"]["tile_dir"]))
+  compression = "raw" if args["--decompress"] else "lz4" if args["--lz4"] else "gzip"
+  parallelism = int(args["--parallelism"]) if args["--parallelism"] else len(os.sched_getaffinity(0))
+  LOGGER.debug(sorted(get_tile_path(cell).name for cell in cells))
+  os.environ["no_proxy"] = ",".join(filter(None, [os.environ.get("no_proxy"), "127.0.0.1"]))
+  outdir.mkdir(parents=True, exist_ok=True)
+  with tempfile.TemporaryDirectory(prefix=".mapterhorn-", dir=outdir) as tmpdir:
+    port = free_port()
+    server = serve(tmpdir, port)
+    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "force": args["--force"]}
+    try:
+      with ProcessPoolExecutor(parallelism) as converters, ThreadPoolExecutor(2 * parallelism) as workers:
+        outcomes = list(workers.map(partial(process_cell, settings=settings, converters=converters), sorted(cells)))
+    finally:
+      server.terminate()
+      server.wait()
+  counts = {outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed")}
+  LOGGER.info(f"Cells: {len(outcomes)}, " + ", ".join(f"{key}: {value}" for key, value in counts.items()) + ". Exiting.")
+  if counts["failed"]:
+    sys.exit(1)
+
+if __name__ == "__main__":
+  main()
