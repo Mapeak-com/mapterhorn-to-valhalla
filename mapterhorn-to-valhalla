@@ -2,13 +2,14 @@
 """Writes Valhalla elevation tiles from Mapterhorn terrain tiles.
 
 Each 1x1 degree cell becomes a 3601x3601 .hgt file in Valhalla's N32/N32E034.hgt
-layout, replacing the cell's files in every format. Cells without Mapterhorn data
-lose their files. Without -t, -b or -g the cells are selected as -t does, and the
-files of cells outside the selection are removed.
+layout. Without -t, -b or -g the cells are selected as -t does. Like
+valhalla_build_elevation, a run writes only cells without a file in any format.
 
 Processed cells are listed in .mapterhorn-to-valhalla.progress in the output
-directory. A run skips the listed cells, so a stopped run resumes; without the
-file, every cell is processed again.
+directory. With --migrate, every selected cell not listed there gets its files
+in every format replaced; cells without Mapterhorn data lose their files, and
+with -t so do cells outside the graph. A stopped --migrate run resumes, and
+without the file every cell is processed again.
 
 Usage:
   mapterhorn-to-valhalla [options] [-v...] [-t | -b BBOX | -g DIR] [-d | -z]
@@ -26,6 +27,7 @@ Options:
   -p --parallelism N       Number of cells converted at once, defaults to the number of available cores.
   -d --decompress          Write uncompressed .hgt files.
   -z --lz4                 Write .hgt.lz4 files. Requires lz4.
+  -m --migrate             Replace the existing files of cells not listed in the progress file.
   -v --verbosity           Accumulative verbosity flags; -v: INFO, -vv: DEBUG.
   -h --help                Show this screen.
 """
@@ -264,6 +266,8 @@ def process_cell(cell, settings, converters):
   name = path.name.split(".")[0]
   if name in settings["done"]:
     return "skipped"
+  if not settings["migrate"] and any(path.with_name(name + ".hgt" + extension).is_file() for extension in EXTENSIONS.values()):
+    return "skipped"
   if STOPPING.is_set():
     return "stopped"
   window = get_window(cell)
@@ -384,8 +388,9 @@ def main():
   remove_leftovers(outdir)
   progress_fp = outdir.joinpath(PROGRESS_FILE)
   done = set(progress_fp.read_text().split()) if progress_fp.is_file() else set()
-  LOGGER.info(f"Resuming, {len(done)} cells already processed." if done else "Processing every cell.")
-  if from_tiles:
+  if args["--migrate"]:
+    LOGGER.info(f"Migrating, {len(done)} cells already processed." if done else "Migrating every cell.")
+  if args["--migrate"] and from_tiles:
     done = remove_unselected(outdir, cells, done)
   progress_fp.write_text("".join(name + "\n" for name in sorted(done)))
   signal.signal(signal.SIGINT, stop)
@@ -393,7 +398,7 @@ def main():
   with tempfile.TemporaryDirectory(prefix=TEMPORARY_PREFIX, dir=outdir) as tmpdir, open(progress_fp, "a") as progress:
     port = free_port()
     server = serve(tmpdir, port)
-    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "done": done, "progress": progress, "lock": threading.Lock()}
+    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "migrate": args["--migrate"], "done": done, "progress": progress, "lock": threading.Lock()}
     try:
       with ProcessPoolExecutor(parallelism, initializer=init_converter) as converters, ThreadPoolExecutor(2 * parallelism) as workers:
         outcomes = list(workers.map(partial(process_cell, settings=settings, converters=converters), sorted(cells)))

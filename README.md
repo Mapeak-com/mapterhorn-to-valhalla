@@ -6,19 +6,25 @@ Each 1x1 degree cell becomes a 3601x3601 `.hgt` file in Valhalla's layout, for e
 
 ## How it works
 
-For every selected cell:
+For every selected cell without a file, in any of the `.hgt`, `.hgt.gz` and `.hgt.lz4` formats:
 
 1. `pmtiles extract` copies the zoom-12 tiles of the cell, plus a 0.01 degree margin, from the Mapterhorn archive.
 2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) and warps them with bilinear resampling onto the 1 arc-second grid.
-3. The file is written to a temporary name, renamed into place, and the cell's files in the other formats (`.hgt`, `.hgt.gz`, `.hgt.lz4`) are removed.
+3. The file is written to a temporary name and renamed into place.
 
 - Pixels without Mapterhorn data are written as `-32768`, Valhalla's no-data value.
-- The files of a cell without any Mapterhorn data, such as one beyond 85.0511 degrees latitude, are removed.
+- A cell without any Mapterhorn data, such as one beyond 85.0511 degrees latitude, gets no file.
+- Every processed cell is appended to `.mapterhorn-to-valhalla.progress` in the output directory.
+
+### Migrating
+
+`--migrate` replaces an existing elevation directory, for example one populated by `valhalla_build_elevation`:
+
+- Every selected cell not listed in the progress file is processed, and its files in the other formats are removed.
+- The files of a cell without Mapterhorn data are removed.
 - With `--from-tiles`, the files of cells outside the graph are removed.
 
-### Resuming
-
-Every processed cell is appended to `.mapterhorn-to-valhalla.progress` in the output directory, and a run skips the cells listed there. A stopped or killed run therefore resumes where it left off, and a run over a newer graph processes only its new cells. Delete the file to process every cell again, for example after a Mapterhorn release.
+A stopped or killed `--migrate` run resumes where it left off. Delete the progress file to migrate every cell again, for example after a Mapterhorn release.
 
 `SIGTERM` or `SIGINT` lets the cells in progress finish, and no new ones start.
 
@@ -42,6 +48,7 @@ The cell selection and the output options are those of `valhalla_build_elevation
 | `-p`, `--parallelism N` | Cells converted at once, default the number of available cores. |
 | `-d`, `--decompress` | Write raw `.hgt` files. |
 | `-z`, `--lz4` | Write `.hgt.lz4` files. |
+| `-m`, `--migrate` | Replace the existing files of cells not listed in the progress file. |
 | `-v` | `-v`: INFO, `-vv`: DEBUG. |
 
 Without `-d` or `-z` the files are gzipped, as with `valhalla_build_elevation`.
@@ -52,7 +59,7 @@ Without `-d` or `-z` the files are gzipped, as with `valhalla_build_elevation`.
 docker run --rm -v "$PWD/valhalla-build:/custom_files" ghcr.io/mapeak-com/mapterhorn-to-valhalla -c /custom_files/valhalla.json -d -v
 ```
 
-With Docker Compose, next to a `valhalla-scripted` build that mounts the same directory, taking the cells from the graph tar served from `./valhalla`:
+With Docker Compose, migrating the elevation directory of a `valhalla-scripted` build that mounts the same directory, taking the cells from the graph tar served from `./valhalla`:
 
 ```yaml
 services:
@@ -66,6 +73,7 @@ services:
       - --config=/custom_files/valhalla.json
       - '--inline-config={"mjolnir":{"tile_extract":"/valhalla/valhalla_tiles.tar"}}'
       - --decompress
+      - --migrate
       - --verbosity
 ```
 
