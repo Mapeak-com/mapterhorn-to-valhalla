@@ -53,7 +53,7 @@ import time
 from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import partial
-from math import ceil, floor, radians
+from math import ceil, floor, log, pi, radians, tan
 from pathlib import Path
 
 def ensure_package(module, package=None):
@@ -194,6 +194,10 @@ def mercator_x(lon):
   """Return the Web Mercator x coordinate of a longitude."""
   return EARTH_RADIUS * radians(lon)
 
+def mercator_y(lat):
+  """Return the Web Mercator y coordinate of a latitude."""
+  return EARTH_RADIUS * log(tan(pi / 4 + radians(lat) / 2))
+
 def wms_xml(url):
   """Return a GDAL WMS description of a z/x/y Terrarium tile service at the given URL template."""
   extent = mercator_x(180.0)
@@ -206,16 +210,22 @@ def wms_xml(url):
     "<ZeroBlockHttpCodes>204,404</ZeroBlockHttpCodes></GDAL_WMS>"
   )
 
-def vrt_xml(url):
-  """Return a GDAL VRT that decodes the Terrarium tiles at the given URL template into elevations, with black pixels as no data."""
+def vrt_xml(url, window):
+  """Return a GDAL VRT that decodes the Terrarium tiles of a window at the given URL template into elevations, with black pixels as no data."""
   wms = wms_xml(url)
   source = gdal.Open(wms)
-  geotransform = ", ".join(repr(value) for value in source.GetGeoTransform())
+  origin_x, size_x, _, origin_y, _, size_y = source.GetGeoTransform()
+  x_off = floor((mercator_x(window[0]) - origin_x) / size_x)
+  y_off = floor((mercator_y(window[3]) - origin_y) / size_y)
+  x_size = ceil((mercator_x(window[2]) - origin_x) / size_x) - x_off
+  y_size = ceil((mercator_y(window[1]) - origin_y) / size_y) - y_off
+  geotransform = ", ".join(repr(value) for value in (origin_x + x_off * size_x, size_x, 0.0, origin_y + y_off * size_y, 0.0, size_y))
   escaped = wms.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-  sources = "".join(f"<SimpleSource><SourceFilename relativeToVRT=\"0\">{escaped}</SourceFilename><SourceBand>{band}</SourceBand></SimpleSource>" for band in (1, 2, 3))
+  rects = f"<SrcRect xOff=\"{x_off}\" yOff=\"{y_off}\" xSize=\"{x_size}\" ySize=\"{y_size}\"/><DstRect xOff=\"0\" yOff=\"0\" xSize=\"{x_size}\" ySize=\"{y_size}\"/>"
+  sources = "".join(f"<SimpleSource><SourceFilename relativeToVRT=\"0\">{escaped}</SourceFilename><SourceBand>{band}</SourceBand>{rects}</SimpleSource>" for band in (1, 2, 3))
   expression = "(B1 == 0 &amp;&amp; B2 == 0 &amp;&amp; B3 == 0) ? %d : B1 * 256 + B2 + B3 / 256 - 32768" % NO_DATA
   return (
-    f"<VRTDataset rasterXSize=\"{source.RasterXSize}\" rasterYSize=\"{source.RasterYSize}\"><SRS>EPSG:3857</SRS><GeoTransform>{geotransform}</GeoTransform>"
+    f"<VRTDataset rasterXSize=\"{x_size}\" rasterYSize=\"{y_size}\"><SRS>EPSG:3857</SRS><GeoTransform>{geotransform}</GeoTransform>"
     f"<VRTRasterBand dataType=\"Float32\" band=\"1\" subClass=\"VRTDerivedRasterBand\"><NoDataValue>{NO_DATA}</NoDataValue>"
     f"<PixelFunctionType>expression</PixelFunctionType><PixelFunctionArguments expression=\"{expression}\" dialect=\"muparser\"/>"
     f"<SourceTransferType>Float64</SourceTransferType>{sources}</VRTRasterBand></VRTDataset>"
@@ -247,7 +257,7 @@ def convert(archive_name, cell, port, path, compression):
   gdal.UseExceptions()
   gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
   gdal.SetCacheMax(CACHE_MB * 1024 * 1024)
-  decoded = gdal.Open(vrt_xml("http://127.0.0.1:%d/%s/${z}/${x}/${y}.webp" % (port, archive_name)))
+  decoded = gdal.Open(vrt_xml("http://127.0.0.1:%d/%s/${z}/${x}/${y}.webp" % (port, archive_name), get_window(cell)))
   half = 0.5 / (HGT_DIM - 1)
   hgt = gdal.Warp("", decoded, format="MEM", dstSRS="EPSG:4326", outputBounds=[cell.lon - half, cell.lat - half, cell.lon + 1 + half, cell.lat + 1 + half], width=HGT_DIM, height=HGT_DIM, resampleAlg="bilinear", srcNodata=NO_DATA, dstNodata=NO_DATA, outputType=gdal.GDT_Int16, warpMemoryLimit=WARP_MB)
   heights = hgt.ReadAsArray()
