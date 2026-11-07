@@ -259,17 +259,20 @@ def convert(archive_name, cell, port, path, compression):
 
 def extract(source, archive, window):
   """Extract the z12 tiles of a window from the Mapterhorn archive, retrying like valhalla_build_elevation."""
-  command = ["pmtiles", "extract", source, str(archive), "--bbox=%.6f,%.6f,%.6f,%.6f" % tuple(window), "--minzoom=%d" % ZOOM, "--maxzoom=%d" % ZOOM, "--quiet"]
+  command = ["pmtiles", "extract", source, str(archive), "--bbox=%.6f,%.6f,%.6f,%.6f" % tuple(window), "--minzoom=%d" % ZOOM, "--maxzoom=%d" % ZOOM]
   for i in range(5):
     if STOPPING.wait((i**2) / 2 * 30):
       return False
-    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, start_new_session=True)
     PROCESSES.add(process)
-    stderr = process.communicate()[1]
+    output = process.communicate()[0]
     PROCESSES.discard(process)
     if process.returncode == 0:
+      if i:
+        LOGGER.info(f"Extracting {archive.stem} succeeded.")
       return True
-    LOGGER.error(f"Extracting {archive.stem} failed: {stderr.strip()}\nTrying again...")
+    reason = re.sub(r"^\S+ \S+ \S+: ", "", re.split(r"[\r\n]+", output.strip())[-1]) or f"exit code {process.returncode}"
+    LOGGER.error(f"Extracting {archive.stem} failed: {reason}." + (" Trying again..." if i < 4 else ""))
   return False
 
 def is_done(cell, outdir, done, migrate):
