@@ -88,6 +88,7 @@ CACHE_MB = 256
 WARP_MB = 64
 STOPPING = threading.Event()
 PROCESSES = set()
+BAR_WIDTH = 40
 
 def get_tile_path(cell):
   """Return the path of a cell's .hgt file relative to the elevation directory, as Valhalla names it."""
@@ -312,7 +313,11 @@ def process_cell(cell, settings, converters):
     settings["progress"].write(name + "\n")
     settings["progress"].flush()
     count = next(settings["count"])
-  LOGGER.info(f"{'Wrote' if written else 'No Mapterhorn data for'} {path.relative_to(settings['outdir'])} ({count}/{settings['remaining']})")
+  latest = f"{'Wrote' if written else 'No Mapterhorn data for'} {path.relative_to(settings['outdir'])}"
+  if HANDLER.tty and LOGGER.isEnabledFor(logging.INFO):
+    HANDLER.progress(count, settings["remaining"], latest)
+  else:
+    LOGGER.info(f"{latest} ({count}/{settings['remaining']})")
   return "written" if written else "no data"
 
 def remove_leftovers(outdir):
@@ -369,12 +374,53 @@ def serve(directory, port):
   LOGGER.critical("pmtiles serve did not start.")
   sys.exit(1)
 
+class ProgressHandler(logging.StreamHandler):
+  """Log to stderr and, on a terminal, keep a progress bar with the latest cell below the messages."""
+
+  def __init__(self):
+    """Write to stderr, with a progress bar only when stderr is a terminal."""
+    super().__init__(sys.stderr)
+    self.bar = ""
+    self.tty = sys.stderr.isatty()
+
+  def emit(self, record):
+    """Write a log message above the progress bar."""
+    if self.bar:
+      self.stream.write("\r\033[K")
+    super().emit(record)
+    if self.bar:
+      self.stream.write(self.bar)
+      self.flush()
+
+  def progress(self, count, total, latest):
+    """Redraw the progress bar with the count of processed cells and the latest one."""
+    filled = BAR_WIDTH * count // total
+    self.acquire()
+    try:
+      self.bar = f"[{'#' * filled}{'.' * (BAR_WIDTH - filled)}] {count}/{total} {100 * count / total:.1f}% {latest}"
+      self.stream.write("\r\033[K" + self.bar)
+      self.flush()
+    finally:
+      self.release()
+
+  def finish(self):
+    """End the progress bar line, leaving it on the screen."""
+    self.acquire()
+    try:
+      if self.bar:
+        self.stream.write("\n")
+        self.flush()
+      self.bar = ""
+    finally:
+      self.release()
+
+HANDLER = ProgressHandler()
+
 def main():
   """Parse the command line, select the cells and write their elevation files."""
   args = docopt(__doc__)
-  handler = logging.StreamHandler()
-  handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)5s: %(message)s"))
-  LOGGER.addHandler(handler)
+  HANDLER.setFormatter(logging.Formatter("%(asctime)s %(levelname)5s: %(message)s"))
+  LOGGER.addHandler(HANDLER)
   LOGGER.setLevel([logging.CRITICAL, logging.INFO, logging.DEBUG][min(args["--verbosity"], 2)])
   config = dict()
   if args["--config"]:
@@ -432,7 +478,8 @@ def main():
     finally:
       server.terminate()
       server.wait()
-  counts = {outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed", "stopped")}
+  HANDLER.finish()
+  counts ={outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed", "stopped")}
   LOGGER.info(f"Cells: {len(outcomes)}, " + ", ".join(f"{key}: {value}" for key, value in counts.items()) + ". Exiting.")
   if counts["failed"] or counts["stopped"]:
     sys.exit(1)
