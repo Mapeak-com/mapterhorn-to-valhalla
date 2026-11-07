@@ -357,6 +357,11 @@ def init_converter():
   signal.signal(signal.SIGINT, signal.SIG_IGN)
   signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
+def tick(bar, finished):
+  """Refresh the progress bar every second until finished, so its times advance between cells."""
+  while not finished.wait(1):
+    bar.refresh()
+
 def stop(signum, frame):
   """Finish the cells in progress and start no new ones; on a second signal, kill the children and exit at once."""
   if STOPPING.is_set():
@@ -446,12 +451,15 @@ def main():
     port = free_port()
     server = serve(tmpdir, port)
     settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "migrate": args["--migrate"], "done": done, "progress": progress, "lock": threading.Lock(), "slots": threading.Semaphore(parallelism), "count": itertools.count(1), "remaining": remaining}
-    settings["bar"] = tqdm(total=remaining, unit="cell", ncols=70, disable=not (sys.stderr.isatty() and LOGGER.isEnabledFor(logging.INFO)))
+    settings["bar"] = tqdm(total=remaining, unit="cell", ncols=70, smoothing=0, disable=not (sys.stderr.isatty() and LOGGER.isEnabledFor(logging.INFO)))
     settings["status"] = tqdm(total=0, position=1, bar_format="{desc}", leave=False, disable=settings["bar"].disable)
+    finished = threading.Event()
+    threading.Thread(target=tick, args=(settings["bar"], finished), daemon=True).start()
     try:
       with logging_redirect_tqdm(loggers=[LOGGER]), ProcessPoolExecutor(parallelism, initializer=init_converter) as converters, ThreadPoolExecutor(2 * parallelism) as workers:
         outcomes = list(workers.map(partial(process_cell, settings=settings, converters=converters), sorted(cells)))
     finally:
+      finished.set()
       settings["status"].close()
       settings["bar"].close()
       server.terminate()
