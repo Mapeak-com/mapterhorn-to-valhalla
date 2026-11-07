@@ -37,7 +37,7 @@ Differences:
 
 `--migrate` replaces the files of an existing elevation directory, for example one populated by `valhalla_build_elevation`. Every processed cell is appended to `.mapterhorn-to-valhalla.progress`, so a migration can be stopped and resumed:
 
-- `SIGTERM` or `SIGINT` lets the cells in progress finish, and no new ones start.
+- `SIGTERM` or `SIGINT` lets the cells in progress finish, and no new ones start. A second one stops at once.
 - A killed run leaves complete files only; the next run removes its temporary files.
 - Running the same command again continues with the cells not listed yet.
 - Deleting the progress file migrates every cell again, for example after a Mapterhorn release.
@@ -70,7 +70,7 @@ The paths in `valhalla.json` (`additional_data.elevation`) resolve inside the co
 For every cell to write:
 
 1. `pmtiles extract` copies the zoom-12 tiles of the cell, plus a 0.01 degree margin, from the Mapterhorn archive.
-2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) and warps them with bilinear resampling onto the 1 arc-second grid.
+2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) with a VRT `expression` pixel function, and warps them with bilinear resampling onto the 1 arc-second grid. The warp streams the cell in chunks, so a conversion needs about 0.4 to 1 GB at any latitude.
 3. The file is written to a temporary name and renamed into place.
 
 Pixels without Mapterhorn data are written as `-32768`, Valhalla's no-data value.
