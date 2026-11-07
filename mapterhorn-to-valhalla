@@ -258,9 +258,10 @@ def peak_memory_mb():
   fields = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
   return int(fields["VmHWM"].split()[0]) // 1024
 
-def convert(archive_name, cell, port, path, compression):
-  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written and its peak memory in MB."""
-  Path("/proc/self/clear_refs").write_text("5")
+def convert(archive_name, cell, port, path, compression, measure):
+  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written and, when measuring, its peak memory in MB."""
+  if measure:
+    Path("/proc/self/clear_refs").write_text("5")
   gdal.UseExceptions()
   gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
   gdal.SetCacheMax(CACHE_MB * 1024 * 1024)
@@ -270,9 +271,9 @@ def convert(archive_name, cell, port, path, compression):
   heights = hgt.ReadAsArray()
   if (heights == NO_DATA).all():
     remove_cell_files(path)
-    return False, peak_memory_mb()
+    return False, peak_memory_mb() if measure else None
   write(path, heights.astype(">i2").tobytes(), compression)
-  return True, peak_memory_mb()
+  return True, peak_memory_mb() if measure else None
 
 def extract(source, archive, window):
   """Extract the z12 tiles of a window from the Mapterhorn archive, retrying like valhalla_build_elevation."""
@@ -324,8 +325,9 @@ def process_cell(cell, settings, converters):
       with settings["slots"]:
         if STOPPING.is_set():
           return "stopped"
-        written, peak = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
-      MEMORY.append(peak)
+        written, peak = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"], LOGGER.isEnabledFor(logging.INFO)).result()
+      if peak is not None:
+        MEMORY.append(peak)
   except Exception as e:
     LOGGER.error(f"Tile {path.name} failed: {e}")
     return "failed"
