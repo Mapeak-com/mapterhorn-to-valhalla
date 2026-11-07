@@ -34,6 +34,7 @@ Options:
 
 import gzip
 import importlib
+import itertools
 import json
 import logging
 import multiprocessing
@@ -269,13 +270,18 @@ def extract(source, archive, window):
     LOGGER.error(f"Extracting {archive.stem} failed: {stderr.strip()}\nTrying again...")
   return False
 
+def is_done(cell, outdir, done, migrate):
+  """Return whether a cell is listed as processed or, without migrating, already has a file in any format."""
+  path = outdir.joinpath(get_tile_path(cell))
+  if path.stem in done:
+    return True
+  return not migrate and any(path.with_name(path.stem + ".hgt" + extension).is_file() for extension in EXTENSIONS.values())
+
 def process_cell(cell, settings, converters):
   """Extract, convert and write one cell, returning its outcome."""
   path = settings["outdir"].joinpath(get_tile_path(cell)).with_suffix(".hgt" + EXTENSIONS[settings["compression"]])
   name = path.name.split(".")[0]
-  if name in settings["done"]:
-    return "skipped"
-  if not settings["migrate"] and any(path.with_name(name + ".hgt" + extension).is_file() for extension in EXTENSIONS.values()):
+  if is_done(cell, settings["outdir"], settings["done"], settings["migrate"]):
     return "skipped"
   if STOPPING.is_set():
     return "stopped"
@@ -305,7 +311,8 @@ def process_cell(cell, settings, converters):
   with settings["lock"]:
     settings["progress"].write(name + "\n")
     settings["progress"].flush()
-  LOGGER.info(f"{'Wrote' if written else 'No Mapterhorn data for'} {path.relative_to(settings['outdir'])}")
+    count = next(settings["count"])
+  LOGGER.info(f"{'Wrote' if written else 'No Mapterhorn data for'} {path.relative_to(settings['outdir'])} ({count}/{settings['remaining']})")
   return "written" if written else "no data"
 
 def remove_leftovers(outdir):
@@ -407,17 +414,18 @@ def main():
   remove_leftovers(outdir)
   progress_fp = outdir.joinpath(PROGRESS_FILE)
   done = set(progress_fp.read_text().split()) if progress_fp.is_file() else set()
-  if args["--migrate"]:
-    LOGGER.info(f"Migrating, {len(done)} cells already processed." if done else "Migrating every cell.")
   if args["--migrate"] and from_tiles:
     done = remove_unselected(outdir, cells, done)
   progress_fp.write_text("".join(name + "\n" for name in sorted(done)))
+  remaining = sum(1 for cell in cells if not is_done(cell, outdir, done, args["--migrate"]))
+  if args["--migrate"]:
+    LOGGER.info(f"Migrating, {len(cells) - remaining} cells already processed, {remaining} remaining." if len(cells) > remaining else f"Migrating every cell, {remaining} remaining.")
   signal.signal(signal.SIGINT, stop)
   signal.signal(signal.SIGTERM, stop)
   with tempfile.TemporaryDirectory(prefix=TEMPORARY_PREFIX, dir=outdir) as tmpdir, open(progress_fp, "a") as progress:
     port = free_port()
     server = serve(tmpdir, port)
-    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "migrate": args["--migrate"], "done": done, "progress": progress, "lock": threading.Lock(), "slots": threading.Semaphore(parallelism)}
+    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "migrate": args["--migrate"], "done": done, "progress": progress, "lock": threading.Lock(), "slots": threading.Semaphore(parallelism), "count": itertools.count(1), "remaining": remaining}
     try:
       with ProcessPoolExecutor(parallelism, initializer=init_converter) as converters, ThreadPoolExecutor(2 * parallelism) as workers:
         outcomes = list(workers.map(partial(process_cell, settings=settings, converters=converters), sorted(cells)))
