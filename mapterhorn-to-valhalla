@@ -36,6 +36,7 @@ import gzip
 import importlib
 import json
 import logging
+import multiprocessing
 import os
 import re
 import shutil
@@ -51,7 +52,7 @@ import time
 from collections import namedtuple
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import partial
-from math import ceil, floor, log, pi, radians, tan
+from math import ceil, floor, radians
 from pathlib import Path
 
 def ensure_package(module, package=None):
@@ -82,7 +83,10 @@ INDEX_BIN_FORMAT = "<QLL"
 PROGRESS_FILE = ".mapterhorn-to-valhalla.progress"
 TEMPORARY_PREFIX = ".mapterhorn-"
 HGT_NAME = re.compile(r"^([NS])([0-9]{2})([WE])([0-9]{3})\.hgt(\.(gz|lz4))?$")
+CACHE_MB = 256
+WARP_MB = 64
 STOPPING = threading.Event()
+PROCESSES = set()
 
 def get_tile_path(cell):
   """Return the path of a cell's .hgt file relative to the elevation directory, as Valhalla names it."""
@@ -187,10 +191,6 @@ def mercator_x(lon):
   """Return the Web Mercator x coordinate of a longitude."""
   return EARTH_RADIUS * radians(lon)
 
-def mercator_y(lat):
-  """Return the Web Mercator y coordinate of a latitude."""
-  return EARTH_RADIUS * log(tan(pi / 4 + radians(lat) / 2))
-
 def wms_xml(url):
   """Return a GDAL WMS description of a z/x/y Terrarium tile service at the given URL template."""
   extent = mercator_x(180.0)
@@ -201,6 +201,21 @@ def wms_xml(url):
     "<TileLevel>" + str(ZOOM) + "</TileLevel><TileCountX>1</TileCountX><TileCountY>1</TileCountY><YOrigin>top</YOrigin></DataWindow>"
     "<Projection>EPSG:3857</Projection><BlockSizeX>512</BlockSizeX><BlockSizeY>512</BlockSizeY><BandsCount>3</BandsCount>"
     "<ZeroBlockHttpCodes>204,404</ZeroBlockHttpCodes></GDAL_WMS>"
+  )
+
+def vrt_xml(url):
+  """Return a GDAL VRT that decodes the Terrarium tiles at the given URL template into elevations, with black pixels as no data."""
+  wms = wms_xml(url)
+  source = gdal.Open(wms)
+  geotransform = ", ".join(repr(value) for value in source.GetGeoTransform())
+  escaped = wms.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+  sources = "".join(f"<SimpleSource><SourceFilename relativeToVRT=\"0\">{escaped}</SourceFilename><SourceBand>{band}</SourceBand></SimpleSource>" for band in (1, 2, 3))
+  expression = "(B1 == 0 &amp;&amp; B2 == 0 &amp;&amp; B3 == 0) ? %d : B1 * 256 + B2 + B3 / 256 - 32768" % NO_DATA
+  return (
+    f"<VRTDataset rasterXSize=\"{source.RasterXSize}\" rasterYSize=\"{source.RasterYSize}\"><SRS>EPSG:3857</SRS><GeoTransform>{geotransform}</GeoTransform>"
+    f"<VRTRasterBand dataType=\"Float32\" band=\"1\" subClass=\"VRTDerivedRasterBand\"><NoDataValue>{NO_DATA}</NoDataValue>"
+    f"<PixelFunctionType>expression</PixelFunctionType><PixelFunctionArguments expression=\"{expression}\" dialect=\"muparser\"/>"
+    f"<SourceTransferType>Float64</SourceTransferType>{sources}</VRTRasterBand></VRTDataset>"
   )
 
 def write(path, data, compression):
@@ -228,19 +243,10 @@ def convert(archive_name, cell, port, path, compression):
   """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written."""
   gdal.UseExceptions()
   gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
-  window = get_window(cell)
-  source = gdal.Open(wms_xml("http://127.0.0.1:%d/%s/${z}/${x}/${y}.webp" % (port, archive_name)))
-  rgb = gdal.Translate("", source, format="MEM", projWin=[mercator_x(window[0]), mercator_y(window[3]), mercator_x(window[2]), mercator_y(window[1])])
-  bands = rgb.ReadAsArray()
-  black = (bands[0] == 0) & (bands[1] == 0) & (bands[2] == 0)
-  elevation = np.where(black, NO_DATA, bands[0] * 256.0 + bands[1] + bands[2] / 256.0 - 32768).astype(np.float32)
-  decoded = gdal.GetDriverByName("MEM").Create("", rgb.RasterXSize, rgb.RasterYSize, 1, gdal.GDT_Float32)
-  decoded.SetGeoTransform(rgb.GetGeoTransform())
-  decoded.SetProjection(rgb.GetProjection())
-  decoded.GetRasterBand(1).SetNoDataValue(NO_DATA)
-  decoded.GetRasterBand(1).WriteArray(elevation)
+  gdal.SetCacheMax(CACHE_MB * 1024 * 1024)
+  decoded = gdal.Open(vrt_xml("http://127.0.0.1:%d/%s/${z}/${x}/${y}.webp" % (port, archive_name)))
   half = 0.5 / (HGT_DIM - 1)
-  hgt = gdal.Warp("", decoded, format="MEM", dstSRS="EPSG:4326", outputBounds=[cell.lon - half, cell.lat - half, cell.lon + 1 + half, cell.lat + 1 + half], width=HGT_DIM, height=HGT_DIM, resampleAlg="bilinear", srcNodata=NO_DATA, dstNodata=NO_DATA, outputType=gdal.GDT_Int16)
+  hgt = gdal.Warp("", decoded, format="MEM", dstSRS="EPSG:4326", outputBounds=[cell.lon - half, cell.lat - half, cell.lon + 1 + half, cell.lat + 1 + half], width=HGT_DIM, height=HGT_DIM, resampleAlg="bilinear", srcNodata=NO_DATA, dstNodata=NO_DATA, outputType=gdal.GDT_Int16, warpMemoryLimit=WARP_MB)
   heights = hgt.ReadAsArray()
   if (heights == NO_DATA).all():
     remove_cell_files(path)
@@ -254,10 +260,13 @@ def extract(source, archive, window):
   for i in range(5):
     if STOPPING.wait((i**2) / 2 * 30):
       return False
-    result = subprocess.run(command, capture_output=True, text=True, start_new_session=True)
-    if result.returncode == 0:
+    process = subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, start_new_session=True)
+    PROCESSES.add(process)
+    stderr = process.communicate()[1]
+    PROCESSES.discard(process)
+    if process.returncode == 0:
       return True
-    LOGGER.error(f"Extracting {archive.stem} failed: {result.stderr.strip()}\nTrying again...")
+    LOGGER.error(f"Extracting {archive.stem} failed: {stderr.strip()}\nTrying again...")
   return False
 
 def process_cell(cell, settings, converters):
@@ -284,7 +293,10 @@ def process_cell(cell, settings, converters):
     elif STOPPING.is_set():
       return "stopped"
     else:
-      written = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
+      with settings["slots"]:
+        if STOPPING.is_set():
+          return "stopped"
+        written = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
   except Exception as e:
     LOGGER.error(f"Tile {path.name} failed: {e}")
     return "failed"
@@ -319,9 +331,15 @@ def init_converter():
   signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 def stop(signum, frame):
-  """Finish the cells in progress and start no new ones."""
-  if not STOPPING.is_set():
-    LOGGER.critical("Stopping after the cells in progress.")
+  """Finish the cells in progress and start no new ones; on a second signal, kill the children and exit at once."""
+  if STOPPING.is_set():
+    LOGGER.critical("Stopping now.")
+    for child in multiprocessing.active_children():
+      child.kill()
+    for process in list(PROCESSES):
+      process.kill()
+    os._exit(1)
+  LOGGER.critical("Stopping after the cells in progress. Repeat to stop now.")
   STOPPING.set()
 
 def free_port():
@@ -333,6 +351,7 @@ def free_port():
 def serve(directory, port):
   """Start pmtiles serve on a local port for the archives in a directory, returning the process once it accepts connections."""
   process = subprocess.Popen(["pmtiles", "serve", str(directory), "--interface=127.0.0.1", "--port=%d" % port], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+  PROCESSES.add(process)
   for i in range(100):
     try:
       socket.create_connection(("127.0.0.1", port), timeout=1).close()
@@ -398,7 +417,7 @@ def main():
   with tempfile.TemporaryDirectory(prefix=TEMPORARY_PREFIX, dir=outdir) as tmpdir, open(progress_fp, "a") as progress:
     port = free_port()
     server = serve(tmpdir, port)
-    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "migrate": args["--migrate"], "done": done, "progress": progress, "lock": threading.Lock()}
+    settings = {"outdir": outdir, "tmpdir": Path(tmpdir), "source": args["--source"], "port": port, "compression": compression, "migrate": args["--migrate"], "done": done, "progress": progress, "lock": threading.Lock(), "slots": threading.Semaphore(parallelism)}
     try:
       with ProcessPoolExecutor(parallelism, initializer=init_converter) as converters, ThreadPoolExecutor(2 * parallelism) as workers:
         outcomes = list(workers.map(partial(process_cell, settings=settings, converters=converters), sorted(cells)))
