@@ -101,7 +101,7 @@ services:
 For every cell to write:
 
 1. `pmtiles extract` copies the zoom-12 tiles of the cell, plus a 0.01 degree margin, from the Mapterhorn archive.
-2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) with a VRT `expression` pixel function, and warps them with bilinear resampling onto the 1 arc-second grid. The warp streams the cell in chunks, so a conversion needs up to about 1 GB at any latitude.
+2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) with a VRT `expression` pixel function, and warps them with bilinear resampling onto the 1 arc-second grid. The warp streams the cell in chunks, so a conversion of a cell needs about 1 GB.
 3. The file is written to a temporary name and renamed into place.
 
 Pixels without Mapterhorn data are written as `-32768`, Valhalla's no-data value.
@@ -121,7 +121,7 @@ mapterhorn-to-valhalla [options] [-v...] [-t | -b BBOX | -g DIR] [-d | -z]
 | `-i`, `--inline-config JSON` | Inline JSON config, overrides `--config`. |
 | `-o`, `--outdir DIR` | Output directory, overrides `additional_data.elevation` of the config. |
 | `-s`, `--source PMTILES` | Mapterhorn archive URL or path, default `https://download.mapterhorn.com/planet.pmtiles`. |
-| `-p`, `--parallelism N` | Cells converted at once, default the number of available cores. Each needs up to about 1 GB of memory. |
+| `-p`, `--parallelism N` | Cells converted at once, default the number of available cores. Each needs about 1 GB of memory. |
 | `-d`, `--decompress` | Write raw `.hgt` files. |
 | `-z`, `--lz4` | Write `.hgt.lz4` files. |
 | `-m`, `--migrate` | Replace the existing files of cells not listed in the progress file. |
