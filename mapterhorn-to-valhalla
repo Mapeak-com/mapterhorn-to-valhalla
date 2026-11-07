@@ -289,7 +289,7 @@ def extract(source, archive, window):
       if i:
         LOGGER.info(f"Extracting {archive.stem} succeeded.")
       return True
-    reason = re.sub(r"^\S+ \S+ \S+: ", "", re.split(r"[\r\n]+", output.strip())[-1]) or f"exit code {process.returncode}"
+    reason = (re.findall(r"\d{4}/\d\d/\d\d \d\d:\d\d:\d\d \S+: ([^\r\n]*)", output) or [f"exit code {process.returncode}"])[-1]
     LOGGER.error(f"Extracting {archive.stem} failed: {reason}." + (" Trying again..." if i < 4 else ""))
   return False
 
