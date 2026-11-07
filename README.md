@@ -90,7 +90,7 @@ mapterhorn-to-valhalla [options] [-v...] [-t | -b BBOX | -g DIR] [-d | -z]
 | `-i`, `--inline-config JSON` | Inline JSON config, overrides `--config`. |
 | `-o`, `--outdir DIR` | Output directory, overrides `additional_data.elevation` of the config. |
 | `-s`, `--source PMTILES` | Mapterhorn archive URL or path, default `https://download.mapterhorn.com/planet.pmtiles`. |
-| `-p`, `--parallelism N` | Cells converted at once, default the number of available cores. |
+| `-p`, `--parallelism N` | Cells converted at once, default the number of available cores. Each needs up to about 1 GB of memory. |
 | `-d`, `--decompress` | Write raw `.hgt` files. |
 | `-z`, `--lz4` | Write `.hgt.lz4` files. |
 | `-m`, `--migrate` | Replace the existing files of cells not listed in the progress file. |
