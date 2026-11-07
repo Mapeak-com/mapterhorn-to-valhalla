@@ -43,7 +43,6 @@ import re
 import shutil
 import signal
 import socket
-import statistics
 import struct
 import subprocess
 import sys
@@ -254,13 +253,13 @@ def remove_cell_files(path, keep=None):
     if other != keep:
       other.unlink(missing_ok=True)
 
-def memory_mb():
-  """Return the peak and current resident memory of this process in MB."""
+def peak_memory_mb():
+  """Return the peak resident memory of this process in MB."""
   fields = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
-  return int(fields["VmHWM"].split()[0]) // 1024, int(fields["VmRSS"].split()[0]) // 1024
+  return int(fields["VmHWM"].split()[0]) // 1024
 
 def convert(archive_name, cell, port, path, compression):
-  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written, and the peak and retained memory in MB."""
+  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written and its peak memory in MB."""
   Path("/proc/self/clear_refs").write_text("5")
   gdal.UseExceptions()
   gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
@@ -269,13 +268,11 @@ def convert(archive_name, cell, port, path, compression):
   half = 0.5 / (HGT_DIM - 1)
   hgt = gdal.Warp("", decoded, format="MEM", dstSRS="EPSG:4326", outputBounds=[cell.lon - half, cell.lat - half, cell.lon + 1 + half, cell.lat + 1 + half], width=HGT_DIM, height=HGT_DIM, resampleAlg="bilinear", srcNodata=NO_DATA, dstNodata=NO_DATA, outputType=gdal.GDT_Int16, warpMemoryLimit=WARP_MB)
   heights = hgt.ReadAsArray()
-  written = not (heights == NO_DATA).all()
-  if written:
-    write(path, heights.astype(">i2").tobytes(), compression)
-  else:
+  if (heights == NO_DATA).all():
     remove_cell_files(path)
-  del decoded, hgt, heights
-  return written, *memory_mb()
+    return False, peak_memory_mb()
+  write(path, heights.astype(">i2").tobytes(), compression)
+  return True, peak_memory_mb()
 
 def extract(source, archive, window):
   """Extract the z12 tiles of a window from the Mapterhorn archive, retrying like valhalla_build_elevation."""
@@ -327,9 +324,8 @@ def process_cell(cell, settings, converters):
       with settings["slots"]:
         if STOPPING.is_set():
           return "stopped"
-        written, peak, retained = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
-      MEMORY.append((peak, retained, name))
-      LOGGER.debug(f"Converting {name} peaked at {peak} MB, retaining {retained} MB.")
+        written, peak = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
+      MEMORY.append(peak)
   except Exception as e:
     LOGGER.error(f"Tile {path.name} failed: {e}")
     return "failed"
@@ -375,12 +371,9 @@ def tick(bar, finished):
     bar.refresh()
 
 def log_memory():
-  """Log the peak and retained memory of the conversions so far."""
+  """Log the mean and max peak memory of the conversions so far."""
   if MEMORY:
-    peaks = [peak for peak, retained, name in MEMORY]
-    retains = [retained for peak, retained, name in MEMORY]
-    top = max(MEMORY)
-    LOGGER.info(f"Memory of {len(MEMORY)} conversions: peak mean {statistics.mean(peaks):.0f} MB, median {statistics.median(peaks):.0f} MB, max {top[0]} MB ({top[2]}); retained mean {statistics.mean(retains):.0f} MB, max {max(retains)} MB.")
+    LOGGER.info(f"Memory per conversion: mean {sum(MEMORY) // len(MEMORY)} MB, max {max(MEMORY)} MB, of {len(MEMORY)} conversions.")
 
 def stop(signum, frame):
   """Finish the cells in progress and start no new ones; on a second signal, kill the children and exit at once."""
