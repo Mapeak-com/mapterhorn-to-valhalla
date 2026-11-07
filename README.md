@@ -70,7 +70,7 @@ The paths in `valhalla.json` (`additional_data.elevation`) resolve inside the co
 For every cell to write:
 
 1. `pmtiles extract` copies the zoom-12 tiles of the cell, plus a 0.01 degree margin, from the Mapterhorn archive.
-2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) with a VRT `expression` pixel function, and warps them with bilinear resampling onto the 1 arc-second grid. The warp streams the cell in chunks, so a conversion needs about 0.4 to 1 GB at any latitude.
+2. GDAL reads them from a local `pmtiles serve`, decodes Terrarium (`R*256 + G + B/256 - 32768`) with a VRT `expression` pixel function, and warps them with bilinear resampling onto the 1 arc-second grid. The warp streams the cell in chunks, so a conversion needs up to about 1 GB at any latitude.
 3. The file is written to a temporary name and renamed into place.
 
 Pixels without Mapterhorn data are written as `-32768`, Valhalla's no-data value.
