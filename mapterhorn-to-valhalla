@@ -28,7 +28,7 @@ Options:
   -d --decompress          Write uncompressed .hgt files.
   -z --lz4                 Write .hgt.lz4 files. Requires lz4.
   -m --migrate             Replace the existing files of cells not listed in the progress file.
-  -v --verbosity           Accumulative verbosity flags; -v: INFO, -vv: DEBUG.
+  -v --verbosity           Be verbose. Show progress bar on terminals.
   -h --help                Show this screen.
 """
 
@@ -144,7 +144,6 @@ def get_cells_with_bbox(bbox_str):
   if len(bbox) != 4 or bbox[0] > bbox[2] or bbox[0] < -180 or bbox[2] > 180 or bbox[1] > bbox[3] or bbox[1] < -90 or bbox[3] > 90:
     LOGGER.critical(f"Bbox invalid: {bbox}")
     sys.exit(1)
-  LOGGER.debug(f"Received valid bbox: {bbox}")
   return {Cell(rect[0], rect[1]) for rect in grid_from_bounds(bbox)}
 
 def get_cells_with_graph(graph_dir):
@@ -416,7 +415,7 @@ def main():
   handler = logging.StreamHandler()
   handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)5s: %(message)s"))
   LOGGER.addHandler(handler)
-  LOGGER.setLevel([logging.CRITICAL, logging.INFO, logging.DEBUG][min(args["--verbosity"], 2)])
+  LOGGER.setLevel([logging.CRITICAL, logging.INFO][min(args["--verbosity"], 1)])
   config = dict()
   if args["--config"]:
     with open(args["--config"]) as f:
@@ -449,7 +448,6 @@ def main():
     sys.exit(1)
   compression = "raw" if args["--decompress"] else "lz4" if args["--lz4"] else "gzip"
   parallelism = int(args["--parallelism"]) if args["--parallelism"] else len(os.sched_getaffinity(0))
-  LOGGER.debug(sorted(get_tile_path(cell).name for cell in cells))
   os.environ["no_proxy"] = ",".join(filter(None, [os.environ.get("no_proxy"), "127.0.0.1"]))
   outdir.mkdir(parents=True, exist_ok=True)
   remove_leftovers(outdir)
