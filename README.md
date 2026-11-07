@@ -125,7 +125,7 @@ mapterhorn-to-valhalla [options] [-v...] [-t | -b BBOX | -g DIR] [-d | -z]
 | `-d`, `--decompress` | Write raw `.hgt` files. |
 | `-z`, `--lz4` | Write `.hgt.lz4` files. |
 | `-m`, `--migrate` | Replace the existing files of cells not listed in the progress file. |
-| `-v` | `-v`: INFO, `-vv`: DEBUG. On a terminal, INFO shows a progress bar with the latest cell, rate and time left, instead of a line per cell. |
+| `-v` | `-v`: INFO, `-vv`: DEBUG. On a terminal, INFO shows a progress bar with the latest cell, rate and time left, instead of a line per cell. When the run ends or stops, INFO logs the peak and retained memory of the conversions; DEBUG logs them per cell. |
 
 Without `-d` or `-z` the files are gzipped, as with `valhalla_build_elevation`.
 

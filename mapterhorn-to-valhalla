@@ -43,6 +43,7 @@ import re
 import shutil
 import signal
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -90,6 +91,7 @@ CACHE_MB = 256
 WARP_MB = 64
 STOPPING = threading.Event()
 PROCESSES = set()
+MEMORY = []
 
 def get_tile_path(cell):
   """Return the path of a cell's .hgt file relative to the elevation directory, as Valhalla names it."""
@@ -252,8 +254,14 @@ def remove_cell_files(path, keep=None):
     if other != keep:
       other.unlink(missing_ok=True)
 
+def memory_mb():
+  """Return the peak and current resident memory of this process in MB."""
+  fields = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
+  return int(fields["VmHWM"].split()[0]) // 1024, int(fields["VmRSS"].split()[0]) // 1024
+
 def convert(archive_name, cell, port, path, compression):
-  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written."""
+  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written, and the peak and retained memory in MB."""
+  Path("/proc/self/clear_refs").write_text("5")
   gdal.UseExceptions()
   gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
   gdal.SetCacheMax(CACHE_MB * 1024 * 1024)
@@ -261,11 +269,13 @@ def convert(archive_name, cell, port, path, compression):
   half = 0.5 / (HGT_DIM - 1)
   hgt = gdal.Warp("", decoded, format="MEM", dstSRS="EPSG:4326", outputBounds=[cell.lon - half, cell.lat - half, cell.lon + 1 + half, cell.lat + 1 + half], width=HGT_DIM, height=HGT_DIM, resampleAlg="bilinear", srcNodata=NO_DATA, dstNodata=NO_DATA, outputType=gdal.GDT_Int16, warpMemoryLimit=WARP_MB)
   heights = hgt.ReadAsArray()
-  if (heights == NO_DATA).all():
+  written = not (heights == NO_DATA).all()
+  if written:
+    write(path, heights.astype(">i2").tobytes(), compression)
+  else:
     remove_cell_files(path)
-    return False
-  write(path, heights.astype(">i2").tobytes(), compression)
-  return True
+  del decoded, hgt, heights
+  return written, *memory_mb()
 
 def extract(source, archive, window):
   """Extract the z12 tiles of a window from the Mapterhorn archive, retrying like valhalla_build_elevation."""
@@ -317,7 +327,9 @@ def process_cell(cell, settings, converters):
       with settings["slots"]:
         if STOPPING.is_set():
           return "stopped"
-        written = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
+        written, peak, retained = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
+      MEMORY.append((peak, retained, name))
+      LOGGER.debug(f"Converting {name} peaked at {peak} MB, retaining {retained} MB.")
   except Exception as e:
     LOGGER.error(f"Tile {path.name} failed: {e}")
     return "failed"
@@ -362,10 +374,19 @@ def tick(bar, finished):
   while not finished.wait(1):
     bar.refresh()
 
+def log_memory():
+  """Log the peak and retained memory of the conversions so far."""
+  if MEMORY:
+    peaks = [peak for peak, retained, name in MEMORY]
+    retains = [retained for peak, retained, name in MEMORY]
+    top = max(MEMORY)
+    LOGGER.info(f"Memory of {len(MEMORY)} conversions: peak mean {statistics.mean(peaks):.0f} MB, median {statistics.median(peaks):.0f} MB, max {top[0]} MB ({top[2]}); retained mean {statistics.mean(retains):.0f} MB, max {max(retains)} MB.")
+
 def stop(signum, frame):
   """Finish the cells in progress and start no new ones; on a second signal, kill the children and exit at once."""
   if STOPPING.is_set():
     LOGGER.critical("Stopping now.")
+    log_memory()
     for child in multiprocessing.active_children():
       child.kill()
     for process in list(PROCESSES):
@@ -465,6 +486,7 @@ def main():
       server.terminate()
       server.wait()
   counts = {outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed", "stopped")}
+  log_memory()
   LOGGER.info(f"Cells: {len(outcomes)}, " + ", ".join(f"{key}: {value}" for key, value in counts.items()) + ". Exiting.")
   if counts["failed"] or counts["stopped"]:
     sys.exit(1)
