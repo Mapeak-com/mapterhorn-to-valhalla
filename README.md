@@ -22,6 +22,12 @@ valhalla_build_elevation --from-tiles --decompress -c valhalla.json -v
 mapterhorn-to-valhalla   --from-tiles --decompress -c valhalla.json -v
 ```
 
+With Docker, for a Valhalla directory `./valhalla` mounted at `/custom_files`, as with `valhalla-scripted`:
+
+```bash
+docker run --rm -v ./valhalla:/custom_files ghcr.io/mapeak-com/mapterhorn-to-valhalla --from-tiles --decompress -c /custom_files/valhalla.json -v
+```
+
 It takes the flags of `valhalla_build_elevation` with the same meaning, writes the same layout and compression, and, like it, writes only cells without a file and removes nothing. Run it where `valhalla_build_elevation` runs, between `valhalla_build_tiles -e build` and `valhalla_build_tiles -s enhance`, or before a build, on the previous graph.
 
 Differences:
@@ -122,12 +128,6 @@ mapterhorn-to-valhalla [options] [-v...] [-t | -b BBOX | -g DIR] [-d | -z]
 | `-v` | `-v`: INFO, `-vv`: DEBUG. On a terminal, INFO shows a progress bar with the latest cell, rate and time left, instead of a line per cell. |
 
 Without `-d` or `-z` the files are gzipped, as with `valhalla_build_elevation`.
-
-## Running
-
-```bash
-docker run --rm -v ./valhalla-build:/custom_files ghcr.io/mapeak-com/mapterhorn-to-valhalla -c /custom_files/valhalla.json -d -v
-```
 
 ## Development
 
