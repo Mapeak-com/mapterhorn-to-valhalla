@@ -90,6 +90,7 @@ CACHE_MB = 256
 WARP_MB = 64
 STOPPING = threading.Event()
 PROCESSES = set()
+MEMORY = []
 
 def get_tile_path(cell):
   """Return the path of a cell's .hgt file relative to the elevation directory, as Valhalla names it."""
@@ -252,8 +253,15 @@ def remove_cell_files(path, keep=None):
     if other != keep:
       other.unlink(missing_ok=True)
 
-def convert(archive_name, cell, port, path, compression):
-  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written."""
+def peak_memory_mb():
+  """Return the peak resident memory of this process in MB."""
+  fields = dict(line.split(":", 1) for line in Path("/proc/self/status").read_text().splitlines())
+  return int(fields["VmHWM"].split()[0]) // 1024
+
+def convert(archive_name, cell, port, path, compression, measure):
+  """Convert the z12 tiles of a served archive into a cell's elevation file, returning whether one was written and, when measuring, its peak memory in MB."""
+  if measure:
+    Path("/proc/self/clear_refs").write_text("5")
   gdal.UseExceptions()
   gdal.SetConfigOption("GDAL_NUM_THREADS", "1")
   gdal.SetCacheMax(CACHE_MB * 1024 * 1024)
@@ -263,9 +271,9 @@ def convert(archive_name, cell, port, path, compression):
   heights = hgt.ReadAsArray()
   if (heights == NO_DATA).all():
     remove_cell_files(path)
-    return False
+    return False, peak_memory_mb() if measure else None
   write(path, heights.astype(">i2").tobytes(), compression)
-  return True
+  return True, peak_memory_mb() if measure else None
 
 def extract(source, archive, window):
   """Extract the z12 tiles of a window from the Mapterhorn archive, retrying like valhalla_build_elevation."""
@@ -317,7 +325,9 @@ def process_cell(cell, settings, converters):
       with settings["slots"]:
         if STOPPING.is_set():
           return "stopped"
-        written = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"]).result()
+        written, peak = converters.submit(convert, archive.stem, cell, settings["port"], path, settings["compression"], LOGGER.isEnabledFor(logging.INFO)).result()
+      if peak is not None:
+        MEMORY.append(peak)
   except Exception as e:
     LOGGER.error(f"Tile {path.name} failed: {e}")
     return "failed"
@@ -362,10 +372,16 @@ def tick(bar, finished):
   while not finished.wait(1):
     bar.refresh()
 
+def log_memory():
+  """Log the mean and max peak memory of the conversions so far."""
+  if MEMORY:
+    LOGGER.info(f"Memory per conversion: mean {sum(MEMORY) // len(MEMORY)} MB, max {max(MEMORY)} MB, of {len(MEMORY)} conversions.")
+
 def stop(signum, frame):
   """Finish the cells in progress and start no new ones; on a second signal, kill the children and exit at once."""
   if STOPPING.is_set():
     LOGGER.critical("Stopping now.")
+    log_memory()
     for child in multiprocessing.active_children():
       child.kill()
     for process in list(PROCESSES):
@@ -465,6 +481,7 @@ def main():
       server.terminate()
       server.wait()
   counts = {outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed", "stopped")}
+  log_memory()
   LOGGER.info(f"Cells: {len(outcomes)}, " + ", ".join(f"{key}: {value}" for key, value in counts.items()) + ". Exiting.")
   if counts["failed"] or counts["stopped"]:
     sys.exit(1)
