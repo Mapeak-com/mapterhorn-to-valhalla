@@ -45,7 +45,32 @@ Differences:
 - The files of a cell without Mapterhorn data are removed.
 - With `--from-tiles`, the files of cells outside the graph are removed.
 
-With Docker Compose, migrating the elevation directory of a `valhalla-scripted` build that mounts the same directory, taking the cells from the graph tar served from `./valhalla`:
+### With Docker Compose
+
+The paths in `valhalla.json`, such as `additional_data.elevation`, resolve inside the container, so the examples mount the Valhalla directories at the same place as `valhalla-scripted`, `/custom_files`. `docker stop` stops the migration; `stop_grace_period` gives the cells in progress time to finish.
+
+A single Valhalla directory, `./valhalla`, holding the config, the graph tiles and the elevation files:
+
+```yaml
+services:
+  mapterhorn-to-valhalla:
+    image: ghcr.io/mapeak-com/mapterhorn-to-valhalla:latest
+    stop_grace_period: 1m
+    volumes:
+      - ./valhalla:/custom_files
+    command:
+      - --config=/custom_files/valhalla.json
+      - --decompress
+      - --migrate
+      - --verbosity
+```
+
+Separate directories for the build and the server:
+
+- `./valhalla-build`, used by the build, holds the config and the elevation files.
+- `./valhalla-server`, used by the server, holds the graph tiles, `valhalla_tiles.tar`.
+
+The migration writes the elevation files in the build directory, for the cells of the graph served from the server directory:
 
 ```yaml
 services:
@@ -54,7 +79,7 @@ services:
     stop_grace_period: 1m
     volumes:
       - ./valhalla-build:/custom_files
-      - ./valhalla:/valhalla:ro
+      - ./valhalla-server:/valhalla:ro
     command:
       - --config=/custom_files/valhalla.json
       - '--inline-config={"mjolnir":{"tile_extract":"/valhalla/valhalla_tiles.tar"}}'
@@ -63,7 +88,7 @@ services:
       - --verbosity
 ```
 
-The paths in `valhalla.json` (`additional_data.elevation`) resolve inside the container, so it mounts the directory at the same place as `valhalla-scripted`. `docker stop` stops it; `stop_grace_period` gives the cells in progress time to finish.
+`--inline-config` points `mjolnir.tile_extract` of the build config to the graph tar of the server.
 
 ## How it works
 
@@ -101,7 +126,7 @@ Without `-d` or `-z` the files are gzipped, as with `valhalla_build_elevation`.
 ## Running
 
 ```bash
-docker run --rm -v "$PWD/valhalla-build:/custom_files" ghcr.io/mapeak-com/mapterhorn-to-valhalla -c /custom_files/valhalla.json -d -v
+docker run --rm -v ./valhalla-build:/custom_files ghcr.io/mapeak-com/mapterhorn-to-valhalla -c /custom_files/valhalla.json -d -v
 ```
 
 ## Development
