@@ -479,7 +479,7 @@ def main():
       server.terminate()
       server.wait()
   HANDLER.finish()
-  counts ={outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed", "stopped")}
+  counts = {outcome: outcomes.count(outcome) for outcome in ("written", "skipped", "no data", "failed", "stopped")}
   LOGGER.info(f"Cells: {len(outcomes)}, " + ", ".join(f"{key}: {value}" for key, value in counts.items()) + ". Exiting.")
   if counts["failed"] or counts["stopped"]:
     sys.exit(1)
